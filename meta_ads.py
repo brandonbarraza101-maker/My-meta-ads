@@ -9,6 +9,14 @@ Examples:
     python3 meta_ads.py campaigns
     python3 meta_ads.py insights --level campaign --date-preset last_7d
     python3 meta_ads.py insights --level ad --since 2026-10-01 --until 2026-10-07 --csv report.csv
+    python3 meta_ads.py pause 120200000000000000
+    python3 meta_ads.py activate 120200000000000000
+    python3 meta_ads.py budget 120200000000000000 --daily 50
+    python3 meta_ads.py create-campaign --name "Fall Sale" --objective OUTCOME_SALES --daily-budget 25
+
+Commands that change things show the change and ask for confirmation first.
+Pass --yes to skip the prompt. New campaigns are always created PAUSED.
+Budgets are entered in your account currency (e.g. 50 = $50.00).
 """
 
 import argparse
@@ -51,6 +59,19 @@ def get_token():
     return token
 
 
+def api_request(url, data=None):
+    try:
+        with urllib.request.urlopen(url, data=data, timeout=60) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.load(e).get("error", {})
+        except ValueError:
+            err = {}
+        msg = err.get("error_user_msg") or err.get("message") or e.reason
+        sys.exit(f"Meta API error {e.code}: {msg}")
+
+
 def api_get(path, params=None):
     """GET a Graph API path, following pagination, and return all data rows."""
     params = dict(params or {})
@@ -58,17 +79,86 @@ def api_get(path, params=None):
     url = f"{BASE_URL}/{path}?{urllib.parse.urlencode(params)}"
     rows = []
     while url:
-        try:
-            with urllib.request.urlopen(url, timeout=60) as resp:
-                body = json.load(resp)
-        except urllib.error.HTTPError as e:
-            err = json.load(e).get("error", {})
-            sys.exit(f"Meta API error {e.code}: {err.get('message', e.reason)}")
+        body = api_request(url)
         if "data" not in body:
             return body
         rows.extend(body["data"])
         url = body.get("paging", {}).get("next")
     return rows
+
+
+def api_post(path, params):
+    params = dict(params)
+    params["access_token"] = get_token()
+    data = urllib.parse.urlencode(params).encode()
+    return api_request(f"{BASE_URL}/{path}", data=data)
+
+
+def to_minor_units(amount):
+    """Meta budgets are in the currency's minor unit (cents for USD)."""
+    return str(round(float(amount) * 100))
+
+
+def fmt_money(minor):
+    return "-" if minor in (None, "", "0") else f"{int(minor) / 100:.2f}"
+
+
+def confirm(args, message):
+    print(message)
+    if args.yes:
+        return
+    if input("Proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+        sys.exit("Cancelled.")
+
+
+def get_object(obj_id):
+    return api_get(obj_id, {"fields": "name,status,daily_budget,lifetime_budget"})
+
+
+def set_status(args, status):
+    obj = get_object(args.id)
+    confirm(args, f"{obj.get('name', args.id)} ({args.id}): {obj.get('status')} -> {status}")
+    api_post(args.id, {"status": status})
+    print(f"Done. Status is now {get_object(args.id).get('status')}.")
+
+
+def cmd_pause(args):
+    set_status(args, "PAUSED")
+
+
+def cmd_activate(args):
+    set_status(args, "ACTIVE")
+
+
+def cmd_budget(args):
+    if (args.daily is None) == (args.lifetime is None):
+        sys.exit("Give exactly one of --daily or --lifetime.")
+    field = "daily_budget" if args.daily is not None else "lifetime_budget"
+    new = to_minor_units(args.daily if args.daily is not None else args.lifetime)
+    obj = get_object(args.id)
+    confirm(args, f"{obj.get('name', args.id)} ({args.id}) {field}: "
+                  f"{fmt_money(obj.get(field))} -> {fmt_money(new)}")
+    api_post(args.id, {field: new})
+    print(f"Done. {field} is now {fmt_money(get_object(args.id).get(field))}.")
+
+
+def cmd_create_campaign(args):
+    params = {
+        "name": args.name,
+        "objective": args.objective,
+        "status": "PAUSED",
+        "special_ad_categories": json.dumps(args.special_ad_category or []),
+    }
+    if args.daily_budget is not None:
+        params["daily_budget"] = to_minor_units(args.daily_budget)
+        params["bid_strategy"] = "LOWEST_COST_WITHOUT_CAP"
+        budget_note = f"daily budget {fmt_money(params['daily_budget'])} (set at campaign level)"
+    else:
+        params["is_adset_budget_sharing_enabled"] = "false"
+        budget_note = "no campaign budget (set budgets on ad sets)"
+    confirm(args, f"Create PAUSED campaign '{args.name}', objective {args.objective}, {budget_note}")
+    result = api_post(f"{account_path()}/campaigns", params)
+    print(f"Created campaign {result.get('id')} (PAUSED). Use 'activate' to turn it on.")
 
 
 def cmd_account(_args):
@@ -142,6 +232,36 @@ def main():
     p.add_argument("--until", help="End date YYYY-MM-DD (use with --since)")
     p.add_argument("--csv", help="Also write all fields to this CSV file")
     p.set_defaults(func=cmd_insights)
+
+    for name, func, help_text in [
+        ("pause", cmd_pause, "Pause a campaign, ad set or ad"),
+        ("activate", cmd_activate, "Turn on a campaign, ad set or ad (starts spending)"),
+    ]:
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("id", help="Campaign, ad set or ad ID")
+        p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+        p.set_defaults(func=func)
+
+    p = sub.add_parser("budget", help="Change the budget of a campaign or ad set")
+    p.add_argument("id", help="Campaign or ad set ID")
+    p.add_argument("--daily", type=float, help="New daily budget, e.g. 50 for $50.00")
+    p.add_argument("--lifetime", type=float, help="New lifetime budget")
+    p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    p.set_defaults(func=cmd_budget)
+
+    p = sub.add_parser("create-campaign", help="Create a new campaign (always PAUSED)")
+    p.add_argument("--name", required=True)
+    p.add_argument("--objective", required=True, choices=[
+        "OUTCOME_AWARENESS", "OUTCOME_TRAFFIC", "OUTCOME_ENGAGEMENT",
+        "OUTCOME_LEADS", "OUTCOME_APP_PROMOTION", "OUTCOME_SALES",
+    ])
+    p.add_argument("--daily-budget", type=float,
+                   help="Campaign-level daily budget; omit to set budgets on ad sets instead")
+    p.add_argument("--special-ad-category", action="append",
+                   choices=["HOUSING", "EMPLOYMENT", "CREDIT", "ISSUES_ELECTIONS_POLITICS"],
+                   help="Required if ads are about housing, jobs, credit or politics")
+    p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
+    p.set_defaults(func=cmd_create_campaign)
 
     args = parser.parse_args()
     args.func(args)
